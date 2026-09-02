@@ -1,0 +1,80 @@
+name: exe builder
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-exe:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build application
+        run: mvn -B clean package
+
+      - name: Create Windows app image and EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $jar = Get-ChildItem -Path target -Filter '*.jar' | Where-Object { $_.Name -notlike '*original*' } | Select-Object -First 1
+          if (-not $jar) {
+            throw 'No application JAR was found in target.'
+          }
+
+          $runtime = Join-Path $env:RUNNER_TEMP 'jre'
+          jlink `
+            --add-modules java.base,java.desktop,java.logging,java.naming,java.net.http,java.xml,jdk.crypto.ec,jdk.unsupported `
+            --output $runtime `
+            --strip-debug `
+            --no-header-files `
+            --no-man-pages `
+            --compress=2
+
+          $inputDir = Join-Path $env:RUNNER_TEMP 'app-input'
+          New-Item -ItemType Directory -Force -Path $inputDir | Out-Null
+          Copy-Item $jar.FullName (Join-Path $inputDir 'neww-clientt.jar')
+
+          jpackage `
+            --type app-image `
+            --name 'Neww Clientt' `
+            --input $inputDir `
+            --main-jar 'neww-clientt.jar' `
+            --main-class 'com.neww.clientt.LauncherApp' `
+            --runtime-image $runtime `
+            --dest target\windows
+
+          $exe = Join-Path 'target\windows\Neww Clientt' 'Neww Clientt.exe'
+          if (-not (Test-Path $exe)) {
+            throw 'jpackage did not create the expected EXE.'
+          }
+
+          Copy-Item $exe 'target\Neww-Clientt.exe'
+
+      - name: Put EXE into ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive -Path 'target\Neww-Clientt.exe' -DestinationPath 'target\Neww-Clientt-Windows.zip' -Force
+
+      - name: Upload downloadable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Neww-Clientt-Windows
+          path: target/Neww-Clientt-Windows.zip
+          if-no-files-found: error
+          retention-days: 30
