@@ -1,0 +1,177 @@
+name: v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: 'Space Client version shown in the installer'
+        required: true
+        default: '1.0.0'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-installer:
+    name: Build Space Client Windows installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build Space Client
+        run: mvn -B clean package
+
+      - name: Verify application dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path 'target\lib\javafx-controls-21.0.8.jar')) { throw 'JavaFX controls dependency was not copied.' }
+          if (-not (Test-Path 'target\lib\javafx-graphics-21.0.8.jar')) { throw 'JavaFX graphics dependency was not copied.' }
+          if (-not (Test-Path 'target\lib\javafx-base-21.0.8.jar')) { throw 'JavaFX base dependency was not copied.' }
+
+      - name: Build self-contained Java runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtime = Join-Path $env:RUNNER_TEMP 'space-client-runtime'
+          if (Test-Path $runtime) { Remove-Item $runtime -Recurse -Force }
+
+          jlink `
+            --module-path "$env:JAVA_HOME\jmods;$env:GITHUB_WORKSPACE\target\lib" `
+            --add-modules java.base,java.desktop,java.logging,java.naming,java.net.http,java.xml,jdk.crypto.ec,jdk.unsupported,javafx.controls `
+            --output $runtime `
+            --strip-debug `
+            --no-header-files `
+            --no-man-pages `
+            --compress=2
+
+          if (-not (Test-Path (Join-Path $runtime 'bin\java.exe'))) { throw 'jlink did not create a usable Java runtime.' }
+          Copy-Item $runtime 'target\space-client-runtime' -Recurse -Force
+
+      - name: Build native Space Client EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $jar = Get-ChildItem 'target' -Filter '*.jar' | Where-Object { $_.Name -notlike '*original*' } | Select-Object -First 1
+          if (-not $jar) { throw 'Application JAR not found.' }
+
+          $inputDir = Join-Path $env:RUNNER_TEMP 'space-client-input'
+          if (Test-Path $inputDir) { Remove-Item $inputDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $inputDir | Out-Null
+          Copy-Item $jar.FullName (Join-Path $inputDir 'SpaceClient.jar')
+
+          New-Item -ItemType Directory -Force -Path 'target\app-image' | Out-Null
+          jpackage `
+            --type app-image `
+            --name 'Space Client' `
+            --app-version '${{ inputs.build_version }}' `
+            --vendor 'Space Client' `
+            --description 'Space Client Minecraft Launcher' `
+            --input $inputDir `
+            --main-jar 'SpaceClient.jar' `
+            --main-class 'com.neww.clientt.LauncherApp' `
+            --runtime-image 'target\space-client-runtime' `
+            --java-options '--add-modules=javafx.controls' `
+            --dest 'target\app-image'
+
+          $appDir = 'target\app-image\Space Client'
+          $exe = Join-Path $appDir 'Space Client.exe'
+          if (-not (Test-Path $exe)) { throw 'jpackage did not create Space Client.exe.' }
+          if (-not (Test-Path (Join-Path $appDir 'runtime\bin\java.exe'))) { throw 'The EXE does not contain the bundled Java runtime.' }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Create installer script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = (Resolve-Path 'target\app-image\Space Client').Path
+          $sourceEscaped = $source.Replace('\', '\\')
+          $version = '${{ inputs.build_version }}'
+
+          @"
+          #define MyAppName "Space Client"
+          #define MyAppVersion "$version"
+          #define MyAppPublisher "Space Client"
+          #define MyAppExeName "Space Client.exe"
+
+          [Setup]
+          AppId={{9F4C0C8D-8A70-4D1B-9B3B-SPACECLIENTV2}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppPublisher={#MyAppPublisher}
+          DefaultDirName={autopf}\Space Client
+          DefaultGroupName=Space Client
+          DisableProgramGroupPage=yes
+          OutputDir=target\installer
+          OutputBaseFilename=Space-Client-Setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          ArchitecturesInstallIn64BitMode=x64compatible
+          UninstallDisplayName=Space Client
+          PrivilegesRequired=lowest
+          ChangesAssociations=no
+          CloseApplications=yes
+          Uninstallable=yes
+
+          [Tasks]
+          Name: "startmenu"; Description: "Create a Start Menu shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+          Name: "desktop"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+
+          [Files]
+          Source: "$sourceEscaped\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+
+          [Icons]
+          Name: "{group}\Space Client"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenu
+          Name: "{autodesktop}\Space Client"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktop
+
+          [Run]
+          Filename: "{app}\{#MyAppExeName}"; Description: "Launch Space Client"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path 'SpaceClient.iss' -Encoding UTF8
+
+      - name: Build installer EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path 'target\installer' | Out-Null
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' 'SpaceClient.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE." }
+          if (-not (Test-Path 'target\installer\Space-Client-Setup.exe')) { throw 'Installer EXE was not created.' }
+
+      - name: Verify installer output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-Item 'target\installer\Space-Client-Setup.exe'
+          if ($exe.Length -lt 100000) { throw 'Installer EXE is unexpectedly small.' }
+          Write-Host "Installer created: $($exe.FullName) ($($exe.Length) bytes)"
+
+      - name: Create downloadable ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive `
+            -Path 'target\installer\Space-Client-Setup.exe' `
+            -DestinationPath 'target\Space-Client-Windows.zip' `
+            -Force
+
+      - name: Upload installer ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Space-Client-Windows-v2
+          path: target/Space-Client-Windows.zip
+          if-no-files-found: error
+          retention-days: 30
