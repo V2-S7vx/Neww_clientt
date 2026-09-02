@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  build-windows-exe:
-    name: Build Windows EXE
+  build-windows-installer:
+    name: Build Space Client Windows Installer
     runs-on: windows-latest
 
     steps:
@@ -27,16 +27,23 @@ jobs:
       - name: Build application
         run: mvn -B clean package
 
-      - name: Create Windows app image and EXE
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Prepare Windows application
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $jar = Get-ChildItem -Path target -Filter '*.jar' | Where-Object { $_.Name -notlike '*original*' } | Select-Object -First 1
-          if (-not $jar) {
-            throw 'No application JAR was found in target.'
-          }
+          if (-not $jar) { throw 'No application JAR was found.' }
 
-          $runtime = Join-Path $env:RUNNER_TEMP 'jre'
+          $appDir = Join-Path $env:RUNNER_TEMP 'space-client-app'
+          New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+          Copy-Item $jar.FullName (Join-Path $appDir 'SpaceClient.jar')
+          Copy-Item 'target\lib' (Join-Path $appDir 'lib') -Recurse
+
+          $runtime = Join-Path $env:RUNNER_TEMP 'space-client-jre'
           jlink `
             --add-modules java.base,java.desktop,java.logging,java.naming,java.net.http,java.xml,jdk.crypto.ec,jdk.unsupported `
             --output $runtime `
@@ -45,36 +52,80 @@ jobs:
             --no-man-pages `
             --compress=2
 
-          $inputDir = Join-Path $env:RUNNER_TEMP 'app-input'
-          New-Item -ItemType Directory -Force -Path $inputDir | Out-Null
-          Copy-Item $jar.FullName (Join-Path $inputDir 'neww-clientt.jar')
+          $launcher = @"
+@echo off
+setlocal
+set APPDIR=%~dp0
+"%APPDIR%runtime\bin\java.exe" --module-path "%APPDIR%lib" --add-modules javafx.controls -cp "%APPDIR%SpaceClient.jar" com.neww.clientt.LauncherApp
+endlocal
+"@
+          Set-Content -Path (Join-Path $appDir 'SpaceClient.cmd') -Value $launcher -Encoding ASCII
+          Copy-Item $runtime (Join-Path $appDir 'runtime') -Recurse
 
-          jpackage `
-            --type app-image `
-            --name 'Neww Clientt' `
-            --input $inputDir `
-            --main-jar 'neww-clientt.jar' `
-            --main-class 'com.neww.clientt.LauncherApp' `
-            --runtime-image $runtime `
-            --dest target\windows
+          New-Item -ItemType Directory -Force -Path 'target\windows' | Out-Null
+          Copy-Item $appDir (Join-Path (Resolve-Path 'target\windows').Path 'Space Client') -Recurse
 
-          $exe = Join-Path 'target\windows\Neww Clientt' 'Neww Clientt.exe'
-          if (-not (Test-Path $exe)) {
-            throw 'jpackage did not create the expected EXE.'
-          }
-
-          Copy-Item $exe 'target\Neww-Clientt.exe'
-
-      - name: Put EXE into ZIP
+      - name: Create installer script
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Compress-Archive -Path 'target\Neww-Clientt.exe' -DestinationPath 'target\Neww-Clientt-Windows.zip' -Force
+          $source = (Resolve-Path 'target\windows\Space Client').Path
+          $sourceEscaped = $source.Replace('\', '\\').Replace('"', '""')
+          @"
+          #define MyAppName "Space Client"
+          #define MyAppVersion "1.0.0"
+          #define MyAppPublisher "Space Client"
+          #define MyAppExeName "SpaceClient.cmd"
 
-      - name: Upload downloadable ZIP
+          [Setup]
+          AppId={{8E7A6A67-3A6A-4F7E-BE1C-SPACECLIENT01}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppPublisher={#MyAppPublisher}
+          DefaultDirName={autopf}\Space Client
+          DefaultGroupName=Space Client
+          DisableProgramGroupPage=no
+          OutputDir=target\installer
+          OutputBaseFilename=Space-Client-Setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          ArchitecturesInstallIn64BitMode=x64compatible
+          UninstallDisplayName=Space Client
+
+          [Tasks]
+          Name: "startmenu"; Description: "Create a Start Menu shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+          Name: "desktop"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+
+          [Files]
+          Source: "$sourceEscaped\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+
+          [Icons]
+          Name: "{group}\Space Client"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenu
+          Name: "{autodesktop}\Space Client"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktop
+
+          [Run]
+          Filename: "{app}\{#MyAppExeName}"; Description: "Launch Space Client"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path 'SpaceClient.iss' -Encoding UTF8
+
+      - name: Build installer EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path 'target\installer' | Out-Null
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' 'SpaceClient.iss'
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
+
+      - name: Create download ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive -Path 'target\installer\Space-Client-Setup.exe' -DestinationPath 'target\Space-Client-Windows.zip' -Force
+
+      - name: Upload downloadable installer ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: Neww-Clientt-Windows
-          path: target/Neww-Clientt-Windows.zip
+          name: Space-Client-Windows
+          path: target/Space-Client-Windows.zip
           if-no-files-found: error
           retention-days: 30
